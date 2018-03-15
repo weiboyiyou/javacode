@@ -1,1 +1,198 @@
 
+MYSQL JDBC快速查询响应的方法，快速返回机制的实现
+一直很纠结，Oracle的快速返回机制，虽然结果集很多，可是它能很快的显示第一个结果，虽然通过MYSQl的客户端可以做到，但是通过JDBC却不行。
+今天用了1个多小时，终于搞定此问题，希望对广大Java朋友在处理数据库时有个参考。
+
+来由：
+    通过命令行客户端加上-q参数，可以极快的响应一个查询。
+    比如结果集为几千万的select * from t1，完整结果集需要20秒，通过-q参数显示第一行只需要不到1秒。
+    但通过jdbc进行查询，却不可以实现如上的效果，无论怎么调整URL参数，也不行。
+    
+过程：
+    查看了-q参数的解释，如下：
+    If you have problems due to insufficient memory for large result sets, 
+    use the --quick option. This forces mysql to retrieve results 
+    from the server a row at a time rather than retrieving the entire result set 
+    and buffering it in memory before displaying it. This is done by returning 
+    the result set using the mysql_use_result() C API function in the client/server 
+    library rather than mysql_store_result().
+    
+    可见，实现快速响应。
+    
+    查看 mysql_use_result() 函数，这个是C的API,如果通过C开发，可以用这个函数。
+    
+    那么JAVA呢？
+    
+    查找标准JDBC规范里面有关函数，没有任何收获。 setFetchSize()看上去有效，可在实际测试里，无任何性能提升。
+    
+    搜索 JDBC mysql_use_result, 有了意外的收获。
+    
+    在MYSQL的JDBC,com.mysql.jdbc.Statement 这个接口里发现了如下的内容：
+     abstract public  void disableStreamingResults() throws SQLException
+
+    Resets this statements fetch size and result set type to the values they 
+    had before enableStreamingResults() was called.
+
+ abstract public  void enableStreamingResults() throws SQLException
+
+    Workaround for containers that 'check' for sane values of Statement.setFetchSize() 
+    so that applications can use the Java variant of libmysql's mysql_use_result() behavior. 
+    
+    
+  原来MySQL提供了自己的一个快速响应的实现。调整测试代码
+  
+      stmt = (com.mysql.jdbc.Statement) con.createStatement();
+      stmt.setFetchSize(1);
+        //按行读取
+        // 打开流方式返回机制
+        stmt.enableStreamingResults();
+        
+        我期待的效果出现了。第一行数据被快速的现实出来，时间不到1秒中。
+        
+结论：
+    MySQL在自己的JDBC驱动里提供了特有的功能，来实现查询的快速响应，
+    特别是结果集非常大或者时间较长，而用户非常想尽快看到第一条结果时特别有效。
+from：http://blog.csdn.net/java2000_net/article/details/6869752
+
+正确使用MySQL JDBC setFetchSize()方法解决JDBC处理大结果集 java.lang.OutOfMemoryError: Java heap space
+昨天在项目中需要对日志的查询结果进行导出功能。
+
+日志导出功能的实现是这样的，输入查询条件，然后对查询结果进行导出。由于日志数据量比较大。多的时候，有上亿条记录。
+
+之前的解决方案都是多次查询，然后使用limit 限制每次查询的条数。然后导出。这样的结果是效率比较低效。
+
+那么能不能一次查询就把所有结果倒出来了？于是我就使用一次查询，不使用limit分页。结果出现 java.lang.OutOfMemoryError: Java heap space问题。
+
+看来是DB服务器端将一次将查询到的结果集全部发送到Java端保存在内存中。由于结果集比较大，所以出现OOM问题。
+
+首先我想到的是游标功能。那么是不是可以使用游标，一次从服务器端慢慢的取呢？上网查询了一下，大家都说MySQL不支持游标功能等等。
+
+后来就去看JDBC代码。找到了setFetchSize()方法，结果设置以后，却不能生效，还是出现OOM问题。
+我的设置如下
+ 
+[java] view plaincopy
+ps=conn.con.prepareStatement("select * from bigTable");  
+ ps.setFetchSize(1000);  
+
+
+ 
+ 
+后来老大在MySQL看到了这样的方法：
+ 
+[java] view plaincopy
+ps = (PreparedStatement) con.prepareStatement("select * from bigTable",  
+                ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);  
+        ps.setFetchSize(Integer.MIN_VALUE);  
+        ps.setFetchDirection(ResultSet.FETCH_REVERSE);  
+
+ 
+对此解释是：MySQL JDBC默认客户端数据接收方式为如下：
+
+默认为从服务器一次取出所有数据放在客户端内存中，fetch size参数不起作用，当一条SQL返回数据量较大时可能会出现JVM OOM。
+要一条SQL从服务器读取大量数据，不发生JVM OOM，可以采用以下方法之一：
+
+1、当statement设置以下属性时，采用的是流数据接收方式，每次只从服务器接收部份数据，直到所有数据处理完毕，不会发生JVM OOM。
+          setResultSetType(ResultSet.TYPE_FORWARD_ONLY);
+          setFetchSize(Integer.MIN_VALUE); 
+
+2、调用statement的enableStreamingResults方法，实际上enableStreamingResults方法内部封装的就是第1种方式。
+3、设置连接属性useCursorFetch=true (5.0版驱动开始支持)，statement以TYPE_FORWARD_ONLY打开，再设置fetch size参数，表示采用服务器端游标，每次从服务器取fetch_size条数据。
+
+设置以后，果然可以解决我的问题。
+ 
+附上代码：
+ 
+[java] view plaincopy
+package com.seven.dbTools.DBTools;  
+  
+import java.sql.Connection;  
+import java.sql.DriverManager;  
+import java.sql.PreparedStatement;  
+import java.sql.ResultSet;  
+import java.sql.SQLException;  
+import java.sql.Statement;  
+import java.util.ArrayList;  
+  
+public class JdbcHandleMySQLBigResultSet {  
+  
+    public static long importData(String sql){  
+        String url = "jdbc:mysql://ipaddress:3306/test?user=username&password=password";  
+        try {  
+            Class.forName("com.mysql.jdbc.Driver");  
+        } catch (ClassNotFoundException e1) {  
+            e1.printStackTrace();  
+        }  
+        long allStart = System.currentTimeMillis();  
+        long count =0;  
+  
+        Connection con = null;  
+        PreparedStatement ps = null;  
+        Statement st = null;  
+        ResultSet rs = null;  
+        try {  
+            con = DriverManager.getConnection(url);  
+              
+            ps = (PreparedStatement) con.prepareStatement(sql,ResultSet.TYPE_FORWARD_ONLY,  
+                      ResultSet.CONCUR_READ_ONLY);  
+                        
+            ps.setFetchSize(Integer.MIN_VALUE);  
+              
+            ps.setFetchDirection(ResultSet.FETCH_REVERSE);  
+  
+            rs = ps.executeQuery();  
+  
+  
+            while (rs.next()) {  
+                  
+                //此处处理业务逻辑  
+                count++;  
+                if(count%600000==0){  
+                    System.out.println(" 写入到第  "+(count/600000)+" 个文件中！");  
+                    long end = System.currentTimeMillis();  
+                }  
+                  
+            }  
+            System.out.println("取回数据量为  "+count+" 行！");  
+        } catch (SQLException e) {  
+            e.printStackTrace();  
+        } finally {  
+            try {  
+                if(rs!=null){  
+                    rs.close();  
+                }  
+            } catch (SQLException e) {  
+                e.printStackTrace();  
+            }  
+            try {  
+                if(ps!=null){  
+                    ps.close();  
+                }  
+            } catch (SQLException e) {  
+                e.printStackTrace();  
+            }  
+            try {  
+                if(con!=null){  
+                    con.close();  
+                }  
+            } catch (SQLException e) {  
+                e.printStackTrace();  
+            }  
+        }  
+        return count;  
+  
+    }  
+  
+    public static void main(String[] args) throws InterruptedException {  
+  
+        String sql = "select * from test.bigTable ";  
+        importData(sql);  
+  
+    }  
+  
+}  
+
+
+ 
+ 
+
+最近对JDBC有了进一步的了解。关于JDBC，推荐我的另一篇文章，用于解决不写文件，从Java IO流中直接导入数据到MySQL：
